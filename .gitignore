@@ -1,3 +1,4 @@
 # Generated reports - never commit these
+QuickSystemInfo_*.html
 SystemSnapshot_*.html
 *.html
