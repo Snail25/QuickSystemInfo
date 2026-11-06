@@ -1,10 +1,13 @@
 #requires -Version 5.1
 <#
-System Snapshot Tool
+Quick System Info
 Gathers a quick point-in-time diagnostic snapshot of this machine and produces
 a single shareable HTML report. Intended as a starting point for troubleshooting,
 not an exhaustive audit.
 #>
+
+# Shown in the report footer so you can tell which copy someone ran. Bump on every change.
+$script:ToolVersion = '1.1.0'
 
 # ---------------------------------------------------------------------------
 # Relaunch in STA if needed (WinForms requires a Single Threaded Apartment)
@@ -14,7 +17,7 @@ if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
         Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-File',"`"$PSCommandPath`"")
         exit
     } else {
-        Write-Warning 'Please re-run with: powershell -STA -File SystemSnapshot.ps1'
+        Write-Warning 'Please re-run with: powershell -STA -File QuickSystemInfo.ps1'
         exit
     }
 }
@@ -81,6 +84,33 @@ function Badge($text, $class) {
     "<span class='badge $class'>$(HtmlEncode $text)</span>"
 }
 
+function Format-Count([int]$Count, [string]$Noun) {
+    if ($Count -eq 1) { "1 $Noun" } else { "$Count ${Noun}s" }
+}
+
+function Format-Size([double]$Bytes) {
+    if ($Bytes -ge 1GB) { '{0:N2} GB' -f ($Bytes / 1GB) }
+    elseif ($Bytes -ge 1MB) { '{0:N1} MB' -f ($Bytes / 1MB) }
+    else { '{0:N0} KB' -f [math]::Ceiling($Bytes / 1KB) }
+}
+
+function Test-PlaceholderValue($Value) {
+    if ($null -eq $Value) { return $true }
+    $v = ([string]$Value).Trim()
+    if (-not $v) { return $true }
+    # Strings firmware vendors leave in place when a real value was never programmed (common on custom builds)
+    $v -match '^(default string|to be filled by o\.?e\.?m\.?|o\.?e\.?m\.?|system serial number|base ?board serial number|chassis serial number|system product name|system manufacturer|system version|not applicable|not specified|n/?a|none|serial|rev ?x\.0x|x\.x+|0+|1234567890?|x+|\.+)$'
+}
+
+function Format-HardwareId($Value) {
+    if (Test-PlaceholderValue $Value) {
+        $raw = ([string]$Value).Trim()
+        $reported = if ($raw) { " (reports &quot;$(HtmlEncode $raw)&quot;)" } else { '' }
+        return "<span class='muted'>Not set by manufacturer$reported</span>"
+    }
+    HtmlEncode $Value
+}
+
 function New-HtmlTable {
     param([array]$Rows, [string[]]$Columns, [string]$EmptyMessage = 'No data available.')
     if (-not $Rows -or $Rows.Count -eq 0) {
@@ -117,6 +147,7 @@ function ConvertTo-SubnetMask {
 function Get-SystemOverview {
     $cs  = Get-CimInstance Win32_ComputerSystem
     $bios = Get-CimInstance Win32_BIOS
+    $board = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue | Select-Object -First 1
     $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
     $mem = Get-CimInstance Win32_PhysicalMemory
     $gpu = Get-CimInstance Win32_VideoController
@@ -127,6 +158,11 @@ function Get-SystemOverview {
         SerialNumber      = $bios.SerialNumber
         BIOSVersion       = $bios.SMBIOSBIOSVersion
         BIOSDate          = $bios.ReleaseDate
+        # Win32_BIOS.SerialNumber is usually the whole PC's serial; the board's own is in Win32_BaseBoard
+        BoardManufacturer = $board.Manufacturer
+        BoardProduct      = $board.Product
+        BoardVersion      = $board.Version
+        BoardSerial       = $board.SerialNumber
         CPU               = $cpu.Name
         Cores             = $cpu.NumberOfCores
         LogicalProcessors = $cpu.NumberOfLogicalProcessors
@@ -168,7 +204,8 @@ function Get-OSInfo {
     $os = Get-CimInstance Win32_OperatingSystem
     $uptime = (Get-Date) - $os.LastBootUpTime
     $licenseMap = @{0='Unlicensed';1='Licensed';2='OOB Grace';3='OOT Grace';4='Non-Genuine Grace';5='Notification';6='Extended Grace'}
-    $license = Get-CimInstance -Query "SELECT LicenseStatus FROM SoftwareLicensingProduct WHERE PartialProductKey IS NOT NULL" -ErrorAction SilentlyContinue | Select-Object -First 1
+    # 55c92734-... is the Windows application ID; without it, an Office licence listed first can be picked up instead
+    $license = Get-CimInstance -Query "SELECT LicenseStatus FROM SoftwareLicensingProduct WHERE PartialProductKey IS NOT NULL AND ApplicationID = '55c92734-d682-4d71-983e-d6ec3f16059f'" -ErrorAction SilentlyContinue | Select-Object -First 1
 
     [PSCustomObject]@{
         Caption          = $os.Caption
@@ -226,16 +263,67 @@ function Get-CrashHistory {
         Select-Object TimeCreated, @{n='Detail';e={'Unexpected shutdown / power loss (not a clean shutdown)'}})
     $bugchecks = @(Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-WER-SystemErrorReporting'; Id=1001} -MaxEvents 15 -ErrorAction SilentlyContinue |
         Select-Object TimeCreated, @{n='Detail';e={ (($_.Message -split "`n") | Select-Object -First 1) }})
-    $minidumps = @()
-    if (Test-Path 'C:\Windows\Minidump') {
-        $minidumps = @(Get-ChildItem 'C:\Windows\Minidump' -Filter *.dmp -ErrorAction SilentlyContinue |
-            Select-Object Name, LastWriteTime, @{n='SizeKB';e={[math]::Round($_.Length / 1KB)}})
+    # Windows can be configured to write dumps somewhere other than the defaults, so check both
+    $crashControl = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -ErrorAction SilentlyContinue
+    $defaultMiniDir  = Join-Path $env:SystemRoot 'Minidump'
+    $defaultFullDump = Join-Path $env:SystemRoot 'MEMORY.DMP'
+    $miniDir  = if ($crashControl.MinidumpDir) { [Environment]::ExpandEnvironmentVariables([string]$crashControl.MinidumpDir).TrimEnd('\') } else { $defaultMiniDir }
+    $fullDump = if ($crashControl.DumpFile) { [Environment]::ExpandEnvironmentVariables([string]$crashControl.DumpFile) } else { $defaultFullDump }
+
+    $dumpType = 'Unknown'
+    if ($null -ne $crashControl.CrashDumpEnabled) {
+        $dumpType = switch ([int]$crashControl.CrashDumpEnabled) {
+            0 { 'None (dumps disabled)' }
+            1 { if ($crashControl.FilterPages -eq 1) { 'Active memory dump' } else { 'Complete memory dump' } }
+            2 { 'Kernel memory dump' }
+            3 { 'Small memory dump (minidump only)' }
+            7 { 'Automatic memory dump' }
+            default { "Unknown ($($crashControl.CrashDumpEnabled))" }
+        }
     }
+
+    $notes = @()
+    $minidumps = @()
+    foreach ($dir in @($defaultMiniDir, $miniDir) | Sort-Object -Unique) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        try {
+            $minidumps += @(Get-ChildItem -LiteralPath $dir -Filter *.dmp -File -ErrorAction Stop |
+                Sort-Object LastWriteTime -Descending | ForEach-Object { ConvertTo-DumpFileRow $_ })
+        } catch {
+            $notes += if ($_.CategoryInfo.Category -eq 'PermissionDenied' -or $_.Exception -is [UnauthorizedAccessException]) {
+                "Could not list $dir - run as Administrator to see minidump files."
+            } else { "Could not list ${dir}: $($_.Exception.Message)" }
+        }
+    }
+
+    $fullDumps = @()
+    foreach ($file in @($defaultFullDump, $fullDump) | Sort-Object -Unique) {
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        try {
+            $fullDumps += ConvertTo-DumpFileRow (Get-Item -LiteralPath $file -Force -ErrorAction Stop)
+        } catch {
+            $notes += "Found $file but could not read its details: $($_.Exception.Message)"
+        }
+    }
+
     [PSCustomObject]@{
         UnexpectedShutdowns = $unexpected
         BugChecks           = $bugchecks
+        DumpType            = $dumpType
+        MinidumpFolder      = $miniDir
+        FullDumpFile        = $fullDump
         Minidumps           = $minidumps
-        FullMemoryDump      = Test-Path 'C:\Windows\MEMORY.DMP'
+        FullDumps           = $fullDumps
+        Notes               = $notes
+    }
+}
+
+function ConvertTo-DumpFileRow([System.IO.FileInfo]$File) {
+    [PSCustomObject]@{
+        Path     = $File.FullName
+        Created  = Format-DT $File.CreationTime
+        Modified = Format-DT $File.LastWriteTime
+        Size     = Format-Size $File.Length
     }
 }
 
@@ -493,8 +581,19 @@ nav.toc { background:var(--card-bg); border:1px solid var(--border); border-radi
 nav.toc ul { list-style:none; margin:0; padding:0; display:flex; flex-wrap:wrap; gap:8px 16px; }
 nav.toc a { color:var(--accent); text-decoration:none; font-size:.9rem; }
 nav.toc a:hover { text-decoration:underline; }
+.toc-actions { display:flex; gap:8px; margin-bottom:10px; }
+.toc-actions button { font:inherit; font-size:.85rem; padding:5px 12px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); cursor:pointer; }
+.toc-actions button:hover { border-color:var(--accent); color:var(--accent); }
 .card { background:var(--card-bg); border:1px solid var(--border); border-radius:10px; padding:20px 24px; margin-bottom:18px; }
 .card h2 { margin-top:0; font-size:1.15rem; border-bottom:1px solid var(--border); padding-bottom:10px; }
+details.section { padding:14px 24px; }
+details.section > summary { display:flex; align-items:center; flex-wrap:wrap; gap:8px 12px; cursor:pointer; list-style:none; }
+details.section > summary::-webkit-details-marker { display:none; }
+details.section > summary::before { content:'\25B8'; color:var(--muted); font-size:.9rem; transition:transform .15s; }
+details.section[open] > summary::before { transform:rotate(90deg); }
+details.section > summary h2 { margin:0; padding:0; border:0; flex:1 1 auto; }
+details.section[open] > summary { border-bottom:1px solid var(--border); padding-bottom:10px; margin-bottom:6px; }
+.section-badges { display:flex; flex-wrap:wrap; gap:6px; }
 .card h3 { font-size:.8rem; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; margin:18px 0 8px; }
 .grid2 { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:10px 24px; margin-bottom:8px; }
 .grid2 > div { display:flex; flex-direction:column; padding:6px 0; border-bottom:1px dashed var(--border); }
@@ -511,6 +610,7 @@ tbody tr:hover { background:rgba(127,127,127,0.06); }
 .badge.ok { background:var(--ok-bg); color:var(--ok-text); }
 .badge.warn { background:var(--warn-bg); color:var(--warn-text); }
 .badge.bad { background:var(--bad-bg); color:var(--bad-text); }
+.badge.info { background:var(--bg); color:var(--muted); border:1px solid var(--border); }
 .muted { color:var(--muted); font-size:.9rem; }
 .ok-text { color:var(--ok-text); }
 .footnote { color:var(--muted); font-size:.75rem; margin-top:6px; }
@@ -523,19 +623,92 @@ footer { text-align:center; color:var(--muted); font-size:.8rem; margin-top:30px
 '@
 }
 
+function Get-SectionBadges {
+    # Header badges, visible while a section is collapsed, so problems stand out without opening it
+    param([string]$Key, [System.Collections.Specialized.OrderedDictionary]$Report)
+    $result = $Report[$Key]
+    $badges = New-Object System.Collections.ArrayList
+    if (-not $result -or -not $result.Success) {
+        [void]$badges.Add((Badge 'Incomplete' 'warn'))
+        return ($badges -join ' ')
+    }
+    $d = $result.Data
+    $hasChecks = $true
+    switch ($Key) {
+        'OSInfo' {
+            if ($d.PendingReboot) { [void]$badges.Add((Badge 'Reboot pending' 'bad')) }
+            if ($d.ActivationStatus -eq 'Unknown') { [void]$badges.Add((Badge 'Activation unknown' 'warn')) }
+            elseif ($d.ActivationStatus -ne 'Licensed') { [void]$badges.Add((Badge 'Not activated' 'warn')) }
+            $upd = $Report['Updates']
+            if ($upd -and $upd.Success -and $upd.Data.FailedUpdates.Count -gt 0) {
+                [void]$badges.Add((Badge (Format-Count $upd.Data.FailedUpdates.Count 'failed update') 'warn'))
+            }
+        }
+        'Hardware' {
+            if ($d.ProblemDevices.Count -gt 0) { [void]$badges.Add((Badge (Format-Count $d.ProblemDevices.Count 'problem device') 'bad')) }
+        }
+        'EventLogs' {
+            $errors   = @($d | Where-Object { $_.LevelDisplayName -in @('Critical','Error') }).Count
+            $warnings = @($d | Where-Object { $_.LevelDisplayName -eq 'Warning' }).Count
+            if ($errors -gt 0)   { [void]$badges.Add((Badge (Format-Count $errors 'error') 'bad')) }
+            if ($warnings -gt 0) { [void]$badges.Add((Badge (Format-Count $warnings 'warning') 'warn')) }
+        }
+        'Crash' {
+            if ($d.BugChecks.Count -gt 0) { [void]$badges.Add((Badge (Format-Count $d.BugChecks.Count 'bluescreen') 'bad')) }
+            if ($d.UnexpectedShutdowns.Count -gt 0) { [void]$badges.Add((Badge (Format-Count $d.UnexpectedShutdowns.Count 'unexpected shutdown') 'warn')) }
+            $dumps = $d.Minidumps.Count + $d.FullDumps.Count
+            if ($dumps -gt 0) { [void]$badges.Add((Badge (Format-Count $dumps 'dump file') 'bad')) }
+            if ($d.Notes.Count -gt 0) { [void]$badges.Add((Badge 'Dump folder unreadable' 'warn')) }
+        }
+        'Network' {
+            if ($d.Adapters.Count -eq 0) { [void]$badges.Add((Badge 'No active adapter' 'bad')) }
+            if ($d.Wireless -and $d.Wireless.SignalPercent -match '(\d+)' -and [int]$matches[1] -lt 50) {
+                [void]$badges.Add((Badge 'Weak Wi-Fi signal' 'warn'))
+            }
+        }
+        'Connectivity' {
+            if (@($d | Where-Object { $_.DNS -and -not $_.DNS.Resolved }).Count -gt 0) { [void]$badges.Add((Badge 'DNS failure' 'bad')) }
+            $worstLoss = ($d | Measure-Object -Property PacketLossPercent -Maximum).Maximum
+            if ($worstLoss -gt 10) { [void]$badges.Add((Badge 'Packet loss' 'bad')) }
+            elseif ($worstLoss -gt 0) { [void]$badges.Add((Badge 'Packet loss' 'warn')) }
+            if (@($d | Where-Object { $_.JitterMs -gt 30 }).Count -gt 0) { [void]$badges.Add((Badge 'High jitter' 'warn')) }
+        }
+        'Disks' {
+            $lowest = ($d.Volumes | Measure-Object -Property FreePercent -Minimum).Minimum
+            if ($null -ne $lowest -and $lowest -lt 10) { [void]$badges.Add((Badge 'Low disk' 'bad')) }
+            elseif ($null -ne $lowest -and $lowest -lt 20) { [void]$badges.Add((Badge 'Low disk' 'warn')) }
+            if (@($d.PhysicalDisks | Where-Object { $_.HealthStatus -ne 'Healthy' }).Count -gt 0) { [void]$badges.Add((Badge 'Disk unhealthy' 'bad')) }
+        }
+        'Security' {
+            if ($d.Defender -and -not $d.Defender.RealTimeProtectionEnabled) { [void]$badges.Add((Badge 'Real-time protection off' 'bad')) }
+            $fwOff = @($d.Firewall | Where-Object { -not $_.Enabled }).Count
+            if ($fwOff -gt 0) { [void]$badges.Add((Badge 'Firewall off' 'bad')) }
+        }
+        'InstalledSoftware' {
+            [void]$badges.Add((Badge (Format-Count @($d).Count 'app') 'info'))
+            $hasChecks = $false
+        }
+        default { $hasChecks = $false }
+    }
+    if ($hasChecks -and $badges.Count -eq 0) { [void]$badges.Add((Badge 'OK' 'ok')) }
+    $badges -join ' '
+}
+
 function Render-SectionWrapper {
-    param([string]$Id, [string]$Title, [string]$BodyHtml, $SectionResult)
+    param([string]$Id, [string]$Title, [string]$BodyHtml, $SectionResult, [string]$BadgesHtml)
     $status = ''
     if ($SectionResult -and -not $SectionResult.Success) {
         $adminHint = if (-not $script:IsAdmin) { ' This may require running as Administrator.' } else { '' }
         $status = "<p class='warn'>&#9888; This section could not be fully collected: $(HtmlEncode $SectionResult.Error)$adminHint</p>"
     }
     @"
-<section id="$Id" class="card">
-<h2>$Title</h2>
+<details id="$Id" class="card section">
+<summary><h2>$Title</h2><span class="section-badges">$BadgesHtml</span></summary>
+<div class="section-body">
 $status
 $BodyHtml
-</section>
+</div>
+</details>
 "@
 }
 
@@ -548,8 +721,12 @@ function Render-SystemOverview($result) {
 <div class='grid2'>
   <div><span class='label'>Manufacturer</span><span class='value'>$(HtmlEncode $d.Manufacturer)</span></div>
   <div><span class='label'>Model</span><span class='value'>$(HtmlEncode $d.Model)</span></div>
-  <div><span class='label'>Serial Number</span><span class='value'>$(HtmlEncode $d.SerialNumber)</span></div>
+  <div><span class='label'>System Serial Number</span><span class='value'>$(Format-HardwareId $d.SerialNumber)</span></div>
   <div><span class='label'>BIOS Version</span><span class='value'>$(HtmlEncode $d.BIOSVersion) ($(Format-DT $d.BIOSDate))</span></div>
+  <div><span class='label'>Motherboard Manufacturer</span><span class='value'>$(Format-HardwareId $d.BoardManufacturer)</span></div>
+  <div><span class='label'>Motherboard Model</span><span class='value'>$(Format-HardwareId $d.BoardProduct)</span></div>
+  <div><span class='label'>Motherboard Version</span><span class='value'>$(Format-HardwareId $d.BoardVersion)</span></div>
+  <div><span class='label'>Motherboard Serial Number</span><span class='value'>$(Format-HardwareId $d.BoardSerial)</span></div>
   <div><span class='label'>Processor</span><span class='value'>$(HtmlEncode $d.CPU)</span></div>
   <div><span class='label'>Cores / Threads</span><span class='value'>$($d.Cores) / $($d.LogicalProcessors)</span></div>
   <div><span class='label'>Total RAM</span><span class='value'>$($d.TotalRAMGB) GB</span></div>
@@ -633,9 +810,20 @@ function Render-Crash($result) {
     $html += New-HtmlTable -Rows $d.UnexpectedShutdowns -Columns @('TimeCreated','Detail') -EmptyMessage 'None found in recent System log history.'
     $html += "<h3>Bug Check / Stop Error Summaries</h3>"
     $html += New-HtmlTable -Rows $d.BugChecks -Columns @('TimeCreated','Detail') -EmptyMessage 'None found in recent System log history.'
-    $html += "<h3>Minidump Files</h3>"
-    $html += New-HtmlTable -Rows $d.Minidumps -Columns @('Name','LastWriteTime','SizeKB') -EmptyMessage 'No minidump files found in C:\Windows\Minidump.'
-    if ($d.FullMemoryDump) { $html += "<p class='warn'>&#9888; A full memory dump (C:\Windows\MEMORY.DMP) is present, indicating at least one prior crash.</p>" }
+    $html += "<h3>Crash Dump Settings</h3>"
+    $html += @"
+<div class='grid2'>
+  <div><span class='label'>Dump Type</span><span class='value'>$(HtmlEncode $d.DumpType)</span></div>
+  <div><span class='label'>Minidump Folder</span><span class='value'>$(HtmlEncode $d.MinidumpFolder)</span></div>
+  <div><span class='label'>Full Dump File</span><span class='value'>$(HtmlEncode $d.FullDumpFile)</span></div>
+</div>
+"@
+    foreach ($note in $d.Notes) { $html += "<p class='warn'>&#9888; $(HtmlEncode $note)</p>" }
+    $html += "<h3>Minidump Files (Bluescreens)</h3>"
+    $html += New-HtmlTable -Rows $d.Minidumps -Columns @('Path','Created','Modified','Size') -EmptyMessage 'No minidump files found.'
+    $html += "<h3>Full Memory Dump</h3>"
+    $html += New-HtmlTable -Rows $d.FullDumps -Columns @('Path','Created','Modified','Size') -EmptyMessage 'No full memory dump file found.'
+    if ($d.FullDumps.Count -gt 0) { $html += "<p class='warn'>&#9888; A full memory dump is present, indicating at least one prior crash.</p>" }
     $html
 }
 
@@ -809,13 +997,14 @@ function Build-HtmlReport {
             [void]$toc.Append("<li><a href='#$($s.Key)'>$($s.Title)</a></li>")
             $sectionResult = $Report[$s.Key]
             $inner = & $s.Render
-            [void]$body.Append((Render-SectionWrapper -Id $s.Key -Title $s.Title -BodyHtml $inner -SectionResult $sectionResult))
+            $badges = Get-SectionBadges -Key $s.Key -Report $Report
+            [void]$body.Append((Render-SectionWrapper -Id $s.Key -Title $s.Title -BodyHtml $inner -SectionResult $sectionResult -BadgesHtml $badges))
         }
     }
 
     $adminBanner = ''
     if (-not $meta.IsAdmin) {
-        $adminBanner = "<p class='warn'>&#9888; This report was generated without Administrator rights. Some details (physical disk health, BitLocker) may be limited or missing.</p>"
+        $adminBanner = "<p class='warn'>&#9888; This report was generated without Administrator rights. Some details (physical disk health, BitLocker, crash dump files) may be limited or missing.</p>"
     }
 
     $css = Get-ReportCss
@@ -825,7 +1014,7 @@ function Build-HtmlReport {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>System Snapshot - $(HtmlEncode $meta.ComputerName)</title>
+<title>Quick System Info - $(HtmlEncode $meta.ComputerName)</title>
 <style>
 $css
 </style>
@@ -833,15 +1022,17 @@ $css
 <body>
 <div class="container">
 <header class="report-header">
-  <h1>System Snapshot Report</h1>
+  <h1>Quick System Info</h1>
   <p>Computer: <strong>$(HtmlEncode $meta.ComputerName)</strong> &nbsp;|&nbsp; Generated: $(Format-DT $meta.GeneratedOn) by $(HtmlEncode $meta.GeneratedBy) &nbsp;|&nbsp; Elevated: $(if ($meta.IsAdmin) {'Yes'} else {'No'})</p>
 </header>
 $adminBanner
-<nav class="toc"><ul>
+<nav class="toc">
+<div class="toc-actions"><button type="button" onclick="setAllSections(true)">Expand all</button><button type="button" onclick="setAllSections(false)">Collapse all</button></div>
+<ul>
 $($toc.ToString())
 </ul></nav>
 $($body.ToString())
-<footer>Generated by SystemSnapshot.ps1 &middot; $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</footer>
+<footer>Generated by Quick System Info v$($script:ToolVersion) &middot; $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</footer>
 </div>
 <script>
 function filterTable(inputId, tableId) {
@@ -852,6 +1043,37 @@ function filterTable(inputId, tableId) {
     rows[i].style.display = text.indexOf(filter) > -1 ? '' : 'none';
   }
 }
+function allSections() { return document.querySelectorAll('details.section'); }
+function setAllSections(open) {
+  var s = allSections();
+  for (var i = 0; i < s.length; i++) { s[i].open = open; }
+}
+// Contents links (and opening the report with #SectionName) open the section they point to
+function openSection(id) {
+  var el = id ? document.getElementById(id) : null;
+  if (el && el.tagName === 'DETAILS') { el.open = true; }
+  return el;
+}
+document.addEventListener('click', function (e) {
+  var a = e.target.closest ? e.target.closest('a[href^="#"]') : null;
+  if (a) { openSection(a.getAttribute('href').slice(1)); }
+});
+window.addEventListener('hashchange', function () { openSection(decodeURIComponent(location.hash.slice(1))); });
+var initial = openSection(decodeURIComponent(location.hash.slice(1)));
+if (initial) { initial.scrollIntoView(); }
+// Print everything, then put the sections back the way they were
+var printState = null;
+window.addEventListener('beforeprint', function () {
+  var s = allSections();
+  printState = [];
+  for (var i = 0; i < s.length; i++) { printState.push(s[i].open); s[i].open = true; }
+});
+window.addEventListener('afterprint', function () {
+  if (!printState) { return; }
+  var s = allSections();
+  for (var i = 0; i < s.length; i++) { s[i].open = printState[i]; }
+  printState = null;
+});
 </script>
 </body>
 </html>
@@ -863,7 +1085,7 @@ function filterTable(inputId, tableId) {
 # ===========================================================================
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'System Snapshot Tool'
+$form.Text = "Quick System Info v$($script:ToolVersion)"
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $form.FormBorderStyle = 'Sizable'
 $form.MaximizeBox = $true
@@ -886,7 +1108,7 @@ $form.Location = New-Object System.Drawing.Point(
 $y = 10
 
 $lblTitle = New-Object System.Windows.Forms.Label
-$lblTitle.Text = 'System Snapshot Tool'
+$lblTitle.Text = 'Quick System Info'
 $lblTitle.Font = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
 $lblTitle.Location = New-Object System.Drawing.Point(16, $y)
 $lblTitle.Size = New-Object System.Drawing.Size(600, 30)
@@ -912,7 +1134,7 @@ $pnlAdmin.Anchor = 'Top,Left,Right'
 $form.Controls.Add($pnlAdmin)
 
 $lblAdminWarn = New-Object System.Windows.Forms.Label
-$lblAdminWarn.Text = "Not running as Administrator. Some checks (disk health, BitLocker) will be limited."
+$lblAdminWarn.Text = "Not running as Administrator. Some checks (disk health, BitLocker, crash dumps) will be limited."
 $lblAdminWarn.Location = New-Object System.Drawing.Point(10, 8)
 $lblAdminWarn.Size = New-Object System.Drawing.Size(340, 38)
 $lblAdminWarn.Anchor = 'Top,Left'
@@ -1005,7 +1227,7 @@ $txtOutputPath = New-Object System.Windows.Forms.TextBox
 $txtOutputPath.Location = New-Object System.Drawing.Point(16, $y)
 $txtOutputPath.Size = New-Object System.Drawing.Size(508, 24)
 $txtOutputPath.Anchor = 'Top,Left,Right'
-$defaultName = "SystemSnapshot_$($env:COMPUTERNAME)_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+$defaultName = "QuickSystemInfo_$($env:COMPUTERNAME)_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
 $txtOutputPath.Text = Join-Path ([Environment]::GetFolderPath('Desktop')) $defaultName
 $form.Controls.Add($txtOutputPath)
 
